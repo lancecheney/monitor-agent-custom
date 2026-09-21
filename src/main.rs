@@ -3,7 +3,6 @@
 mod collect;
 mod route;
 
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
@@ -135,12 +134,6 @@ struct PingTask {
     id: i64,
     target: String,
     interval: u64,
-    #[serde(default = "tcp_protocol")]
-    protocol: String,
-}
-
-fn tcp_protocol() -> String {
-    "tcp".into()
 }
 
 fn notify(method: &str, params: serde_json::Value) -> Message {
@@ -458,12 +451,8 @@ fn respawn_ping_tasks(
         wanted.truncate(MAX_PING_TASKS);
     }
     running.retain(|(task, handle)| {
-        let keep = wanted.iter().any(|w| {
-            w.id == task.id
-                && w.target == task.target
-                && w.interval == task.interval
-                && w.protocol == task.protocol
-        });
+        let keep =
+            wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
         if !keep {
             handle.abort();
         }
@@ -486,17 +475,7 @@ fn respawn_ping_tasks(
             let mut said = false;
             loop {
                 ticker.tick().await;
-                let result = match spawned.protocol.as_str() {
-                    "icmp" => icmp_ping(&spawned.target).await,
-                    "tcp" => tcp_ping(&spawned.target).await,
-                    other => {
-                        if !std::mem::replace(&mut said, true) {
-                            eprintln!("{}: unsupported probe protocol {other:?}", spawned.target);
-                        }
-                        continue;
-                    }
-                };
-                let Some(latency) = result else {
+                let Some(latency) = tcp_ping(&spawned.target).await else {
                     if !std::mem::replace(&mut said, true) {
                         eprintln!(
                             "{}: name resolution runs past {}ms, so these rounds report no sample \
@@ -568,35 +547,6 @@ async fn tcp_ping(target: &str) -> Option<i32> {
     // Only the deadline above is ambiguous.
     let Ok(addresses) = resolved else { return Some(-1) };
     Some(handshake(addresses).await)
-}
-
-static NEXT_PING_ID: AtomicU16 = AtomicU16::new(1);
-
-/// Round-trip time of one ICMP echo in milliseconds; -1 when no resolved
-/// address answered, `None` when name resolution overran the probe deadline.
-/// Resolution stays outside the timer so DNS latency is not presented as link
-/// latency, matching the TCP probe's contract.
-async fn icmp_ping(target: &str) -> Option<i32> {
-    let Ok(resolved) = tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host((target, 0))).await
-    else {
-        return None;
-    };
-    let Ok(addresses) = resolved else { return Some(-1) };
-    for address in addresses.take(MAX_PING_ADDRS) {
-        let host = address.ip();
-        let config = match host {
-            std::net::IpAddr::V4(_) => surge_ping::Config::default(),
-            std::net::IpAddr::V6(_) => surge_ping::Config::builder().kind(surge_ping::ICMP::V6).build(),
-        };
-        let Ok(client) = surge_ping::Client::new(&config) else { continue };
-        let id = NEXT_PING_ID.fetch_add(1, Ordering::Relaxed);
-        let mut pinger = client.pinger(host, surge_ping::PingIdentifier(id)).await;
-        pinger.timeout(HANDSHAKE_DEADLINE);
-        if let Ok((_, elapsed)) = pinger.ping(surge_ping::PingSequence(0), &[0; 56]).await {
-            return Some(elapsed.as_millis().min(i32::MAX as u128) as i32);
-        }
-    }
-    Some(-1)
 }
 
 /// Round-trip time of the first address that completes a handshake.
@@ -850,12 +800,7 @@ mod tests {
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
         let mut running = Vec::new();
-        let task = |id, target: &str, interval| PingTask {
-            id,
-            target: target.into(),
-            interval,
-            protocol: "tcp".into(),
-        };
+        let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
 
         respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
         assert_eq!(running.len(), 2);
@@ -873,12 +818,6 @@ mod tests {
         // the old address.
         assert_ne!(running[1].1.id(), second, "a retargeted task must be restarted");
 
-        let first = running[0].1.id();
-        let mut changed_protocol = task(1, "a:1", 60);
-        changed_protocol.protocol = "icmp".into();
-        respawn_ping_tasks(&mut running, vec![changed_protocol], &tx);
-        assert_ne!(running[0].1.id(), first, "changing TCP to ICMP must restart the probe");
-
         // Interval 0 must not take the probe down: tokio's interval panics on
         // a zero period, and a panicked task stops reporting silently.
         respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
@@ -890,14 +829,5 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
-    }
-
-    #[test]
-    fn an_old_hub_task_without_a_protocol_stays_tcp() {
-        let task: PingTask = serde_json::from_value(serde_json::json!({
-            "id": 1, "target": "1.1.1.1:443", "interval": 60
-        }))
-        .unwrap();
-        assert_eq!(task.protocol, "tcp");
     }
 }
