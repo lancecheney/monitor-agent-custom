@@ -21,6 +21,12 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}
+        env:
+          # Some budget VPS hosts expose only the original x86-64 feature set
+          # (SSE2, without SSSE3/SSE4/AES). Keep the published amd64 agent
+          # runnable there instead of inheriting newer runner/container flags.
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-musl' && '-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-sse4.1,-sse4.2,-ssse3,-aes,-pclmulqdq' || '' }}
+          CFLAGS_x86_64_unknown_linux_musl: ${{ matrix.target == 'x86_64-unknown-linux-musl' && '-O2 -march=x86-64 -mtune=generic' || '' }}
       # install.sh downloads exactly this name; changing it breaks every
       # install command the hub issues.
       - run: cp "target/${{ matrix.target }}/release/monitor-agent" "monitor-agent-${{ matrix.target }}"
