@@ -388,7 +388,9 @@ async fn session(
     for (_, handle) in ping_tasks {
         handle.abort();
     }
-    if let Some(handle) = route_test { handle.abort(); }
+    if let Some(handle) = route_test {
+        handle.abort();
+    }
     result
 }
 
