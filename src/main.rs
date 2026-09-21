@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod route;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -322,6 +323,7 @@ async fn session(
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut route_test: Option<tokio::task::JoinHandle<()>> = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -351,6 +353,25 @@ async fn session(
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
+                            } else if rpc.method == "route.test" {
+                                if route_test.as_ref().is_some_and(|task| !task.is_finished()) {
+                                    eprintln!("route test ignored: one is already running");
+                                } else if let Ok(request) = serde_json::from_value::<route::Request>(rpc.params) {
+                                    let tx = result_tx.clone();
+                                    route_test = Some(tokio::spawn(async move {
+                                        let request_id = request.request_id.clone();
+                                        let province = request.province.clone();
+                                        let rounds = request.rounds;
+                                        let params = match route::run(request).await {
+                                            Ok(result) => serde_json::to_value(result).unwrap_or_default(),
+                                            Err(error) => serde_json::json!({
+                                                "request_id": request_id, "province": province, "rounds": rounds,
+                                                "items": [], "error": error.to_string().chars().take(240).collect::<String>()
+                                            }),
+                                        };
+                                        let _ = tx.send(notify("route.result", params)).await;
+                                    }));
+                                }
                             }
                         }
                     }
@@ -367,6 +388,7 @@ async fn session(
     for (_, handle) in ping_tasks {
         handle.abort();
     }
+    if let Some(handle) = route_test { handle.abort(); }
     result
 }
 
