@@ -30,8 +30,7 @@ pub struct RouteItem {
     pub carrier: &'static str,
     pub carrier_label: &'static str,
     pub target: String,
-    pub line: String,
-    pub path: String,
+    pub hops: Vec<RouteHop>,
     pub success: u8,
     pub rounds: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,8 +114,7 @@ pub async fn run(request: Request) -> Result<ResultMessage> {
                 carrier,
                 carrier_label: label,
                 target,
-                line: "测试失败".into(),
-                path: String::new(),
+                hops: Vec::new(),
                 success: 0,
                 rounds: request.rounds,
                 error: Some(errors.pop().unwrap_or_else(|| "未知错误".into()).chars().take(240).collect()),
@@ -160,25 +158,33 @@ async fn trace(binary: &str, carrier: &'static str, label: &'static str, target:
     }
     let payload: Value = serde_json::from_slice(&output.stdout).context("invalid NextTrace JSON")?;
     let hops = successful_hops(&payload);
-    let mut known = Vec::new();
-    for hop in &hops {
-        for asn in hop_asns(hop) {
-            if !known.contains(&asn) {
-                known.push(asn);
-            }
-        }
-    }
-    let line = classify(carrier, &hops).unwrap_or_else(|| "未识别".into());
     Ok(RouteItem {
         carrier,
         carrier_label: label,
         target: target.into(),
-        line,
-        path: known.iter().map(|asn| format!("AS{asn}")).collect::<Vec<_>>().join(" → "),
+        hops: measured_hops(&hops),
         success: 1,
         rounds: 1,
         error: None,
     })
+}
+
+/// One measured hop as the hub receives it: the address that answered and every
+/// AS number reported for it, in trace order. The hub owns the naming.
+#[derive(Clone, Debug, Serialize)]
+pub struct RouteHop {
+    pub ip: String,
+    pub asns: Vec<String>,
+}
+
+fn measured_hops(hops: &[Value]) -> Vec<RouteHop> {
+    hops.iter()
+        .filter_map(|hop| {
+            let ip = hop_ips(hop).into_iter().next().unwrap_or_default();
+            let asns = hop_asns(hop);
+            (ip.len() >= 7 || !asns.is_empty()).then_some(RouteHop { ip, asns })
+        })
+        .collect()
 }
 
 fn successful_hops(payload: &Value) -> Vec<Value> {
@@ -270,138 +276,6 @@ fn hop_ips(hop: &Value) -> Vec<String> {
         .collect()
 }
 
-fn inferred(ip: &str) -> Option<&'static str> {
-    let entries = [
-        ("4809", &["59.43."][..]),
-        ("23764", &["203.22.182.", "203.22.178.", "203.22.179.", "203.128.224.", "69.194."]),
-        ("4134", &["202.97.", "202.96.", "219.141.", "219.142.", "106.37."]),
-        ("4837", &["219.158."]),
-        ("9929", &["210.14.", "210.51.", "210.78.", "218.105."]),
-        (
-            "10099",
-            &[
-                "103.214.",
-                "103.228.68.",
-                "103.239.176.",
-                "118.26.151.",
-                "162.245.124.",
-                "202.77.23.",
-                "203.160.66.",
-                "203.160.75.",
-            ],
-        ),
-        ("58807", &["223.120.", "223.119."]),
-        ("9808", &["221.183.", "111.24.", "111.13."]),
-    ];
-    for (asn, prefixes) in entries {
-        if prefixes.iter().any(|prefix| ip.starts_with(prefix)) {
-            return Some(asn);
-        }
-    }
-    let octets: Vec<_> = ip.split('.').collect();
-    if octets.len() == 4
-        && octets[0] == "162"
-        && octets[1] == "219"
-        && matches!(octets[2].parse::<u8>(), Ok(32..=39 | 85))
-    {
-        return Some("10099");
-    }
-    None
-}
-
-fn records(hops: &[Value]) -> Vec<(Vec<String>, HashSet<String>)> {
-    hops.iter()
-        .map(|hop| {
-            let ips = hop_ips(hop);
-            let mut asns: HashSet<String> = hop_asns(hop).into_iter().collect();
-            for ip in &ips {
-                if let Some(asn) = inferred(ip) {
-                    asns.insert(asn.into());
-                }
-            }
-            (ips, asns)
-        })
-        .collect()
-}
-
-fn classify(carrier: &str, hops: &[Value]) -> Option<String> {
-    let records = records(hops);
-    match carrier {
-        "ct" => {
-            let first = records.iter().position(|(ips, asns)| {
-                asns.contains("4809") || ips.iter().any(|ip| ip.starts_with("59.43."))
-            })?;
-            for (index, (ips, _)) in records.iter().enumerate().skip(first) {
-                if ips.iter().any(|ip| ip.starts_with("59.43.245."))
-                    && records.iter().skip(index + 1).any(|(later_ips, later_asns)| {
-                        later_asns.contains("4134")
-                            || later_asns.contains("4847")
-                            || later_ips.iter().any(|ip| {
-                                ["202.97.", "202.96.", "219.141.", "219.142.", "106.37."]
-                                    .iter()
-                                    .any(|prefix| ip.starts_with(prefix))
-                            })
-                    })
-                {
-                    return Some("CN2GT".into());
-                }
-            }
-            if records.iter().any(|(ips, asns)| {
-                asns.contains("23764")
-                    || ips.iter().any(|ip| {
-                        ["203.22.182.", "203.22.178.", "203.22.179.", "203.128.224.", "69.194."]
-                            .iter()
-                            .any(|prefix| ip.starts_with(prefix))
-                    })
-            }) {
-                Some("CTGGIA".into())
-            } else {
-                Some("CN2GIA".into())
-            }
-        }
-        "cu" => {
-            let cug = records.iter().position(|(ips, asns)| {
-                asns.contains("10099") || ips.iter().any(|ip| inferred(ip) == Some("10099"))
-            });
-            if let Some(index) = cug {
-                let after = &records[index + 1..];
-                if after.iter().any(|(_, a)| a.contains("9929")) {
-                    Some("CUG+9929".into())
-                } else if after.iter().any(|(_, a)| {
-                    ["4837", "4808", "17816", "135061", "136958", "140979"].iter().any(|v| a.contains(*v))
-                }) {
-                    Some("CUG+4837".into())
-                } else {
-                    Some("CUG".into())
-                }
-            } else if records.iter().any(|(_, a)| a.contains("9929")) {
-                Some("9929".into())
-            } else if records.iter().any(|(_, a)| {
-                ["4837", "4808", "17816", "135061", "136958", "140979"].iter().any(|v| a.contains(*v))
-            }) {
-                Some("4837".into())
-            } else {
-                None
-            }
-        }
-        "cm" => {
-            let cmin2 = records.iter().any(|(_, a)| a.contains("58807"));
-            let cmi = records.iter().any(|(_, a)| {
-                ["58453", "9808", "56040", "56041", "56042", "56044", "56045", "56046", "56047", "56048"]
-                    .iter()
-                    .any(|v| a.contains(*v))
-            });
-            match (cmin2, cmi) {
-                (true, true) => Some("CMIN2+CMI".into()),
-                (true, false) => Some("CMIN2".into()),
-                (false, true) => Some("CMI".into()),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,19 +293,36 @@ mod tests {
         assert!(!valid_province("任意地址"));
     }
 
+    /// The agent ships raw hops; the hub decides the name. A NextTrace JSON
+    /// payload's successful candidates collapse to one hop each, keeping the
+    /// tracer's order and every AS number seen there.
     #[test]
-    fn classifies_three_carriers_from_ordered_paths() {
-        assert_eq!(
-            classify("ct", &hops(&[("59.43.1.1", "4809"), ("203.0.113.1", "4134")])),
-            Some("CN2GIA".into())
-        );
-        assert_eq!(
-            classify("cu", &hops(&[("103.214.1.1", "10099"), ("210.14.1.1", "9929")])),
-            Some("CUG+9929".into())
-        );
-        assert_eq!(
-            classify("cm", &hops(&[("223.120.1.1", "58807"), ("221.183.1.1", "9808")])),
-            Some("CMIN2+CMI".into())
-        );
+    fn measured_hops_keep_order_and_every_as_number() {
+        let payload = serde_json::json!({"Hops": [
+            [{"Address": "45.207.58.10", "Geo": {"asnumber": "205548"}, "Success": true}],
+            [{"Address": "210.171.224.1", "Geo": {"asnumber": "2497"}, "Success": true}],
+            [{"Address": "202.97.96.1", "Geo": {"asnumber": "4134"}, "Success": false},
+             {"Address": "202.97.96.1", "Geo": {"asnumber": "4134"}, "Success": true}],
+        ]});
+        let hops = measured_hops(&successful_hops(&payload));
+        assert_eq!(hops.len(), 3);
+        assert_eq!(hops[0].ip, "45.207.58.10");
+        assert_eq!(hops[0].asns, vec!["205548"]);
+        assert_eq!(hops[2].ip, "202.97.96.1", "the successful candidate is the one kept");
+        assert_eq!(hops[2].asns, vec!["4134"]);
+    }
+
+    /// A hop the tracer resolved only as an AS (no usable address) still ships,
+    /// so the hub's path rendering loses nothing; a hop with neither is dropped.
+    #[test]
+    fn as_only_hops_ship_and_empty_ones_do_not() {
+        let payload = serde_json::json!({"Hops": [
+            [{"Address": "", "Geo": {"asnumber": "4134"}, "Success": true}],
+            [{"Address": "203.0.113.1", "Success": true}],
+        ]});
+        let hops = measured_hops(&successful_hops(&payload));
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].asns, vec!["4134"]);
+        assert_eq!(hops[1].ip, "203.0.113.1");
     }
 }
