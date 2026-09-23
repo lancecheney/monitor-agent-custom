@@ -246,7 +246,29 @@ fn hop_region(hop: &Value) -> String {
             field(geo, "city")
         }
     };
-    region.chars().take(16).collect()
+    normalize_region(&region).chars().take(16).collect()
+}
+
+/// NextTrace geolabels the same place inconsistently hop to hop -- 台湾/台湾省/
+/// 中国台湾, 广东/广东省 -- and a hop that resolves no closer than the country
+/// arrives as a bare 中国 between two provinces. Unify the variants and drop
+/// the bare-country hop, or the region chain fills with repeats that read as
+/// detours the path never made.
+fn normalize_region(region: &str) -> String {
+    let mapped = match region.trim() {
+        "中国台湾" | "台湾省" | "台湾地区" => "台湾",
+        "中国香港" | "香港特别行政区" => "香港",
+        "中国澳门" | "澳门特别行政区" => "澳门",
+        other => other,
+    };
+    let stripped = ["特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区", "自治区", "省", "市"]
+        .iter()
+        .find_map(|suffix| mapped.strip_suffix(suffix))
+        .unwrap_or(mapped);
+    match stripped {
+        "" | "中国" | "本地" | "保留地址" => String::new(),
+        place => place.to_owned(),
+    }
 }
 
 fn successful_hops(payload: &Value) -> Vec<Value> {
@@ -391,20 +413,25 @@ mod tests {
     /// A mainland hop names its province, 香港 keeps its region although
     /// NextTrace files it under country 中国, and everywhere else the country
     /// is the label -- the panel prints 台湾-香港-浙江 style chains, not
-    /// 加利福尼亚州.
+    /// 加利福尼亚州. Variants collapse (浙江省/台湾省/中国香港) and a hop no
+    /// closer than 中国 drops out rather than splicing the chain.
     #[test]
     fn regions_prefer_cn_province_then_region_then_country() {
         let payload = serde_json::json!({"Hops": [
-            [{"Address": "202.97.96.1", "Geo": {"country": "中国", "prov": "浙江", "city": "杭州"}, "Success": true}],
-            [{"Address": "45.207.58.10", "Geo": {"country": "中国", "prov": "香港"}, "Success": true}],
+            [{"Address": "202.97.96.1", "Geo": {"country": "中国", "prov": "浙江省", "city": "杭州"}, "Success": true}],
+            [{"Address": "45.207.58.10", "Geo": {"country": "中国", "prov": "中国香港"}, "Success": true}],
             [{"Address": "38.55.108.1", "Geo": {"country": "美国", "prov": "加利福尼亚州", "city": "洛杉矶"}, "Success": true}],
-            [{"Address": "203.0.113.7", "Geo": {}, "Success": true}],
+            [{"Address": "203.0.113.7", "Geo": {"country": "中国", "prov": ""}, "Success": true}],
+            [{"Address": "203.0.113.8", "Geo": {"country": "中国台湾", "prov": "台湾省"}, "Success": true}],
+            [{"Address": "203.0.113.9", "Geo": {}, "Success": true}],
         ]});
         let hops = measured_hops(&successful_hops(&payload));
         assert_eq!(hops[0].region, "浙江");
         assert_eq!(hops[1].region, "香港");
         assert_eq!(hops[2].region, "美国");
         assert_eq!(hops[3].region, "");
+        assert_eq!(hops[4].region, "台湾");
+        assert_eq!(hops[5].region, "");
     }
 
     /// Hubs that predate the v6 flag keep working: `ipv6` defaults to false and
