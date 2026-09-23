@@ -15,6 +15,10 @@ pub struct Request {
     pub request_id: String,
     pub province: String,
     pub rounds: u8,
+    /// V6 runs second, after every v4 carrier finished, and only on machines
+    /// with a default IPv6 route; `serde(default)` keeps older hubs compatible.
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +31,7 @@ pub struct ResultMessage {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RouteItem {
+    pub stack: &'static str,
     pub carrier: &'static str,
     pub carrier_label: &'static str,
     pub target: String,
@@ -89,37 +94,47 @@ pub async fn run(request: Request) -> Result<ResultMessage> {
         .into_iter()
         .find(|path| Path::new(path).is_file())
         .context("NextTrace is not installed")?;
-    let mut items = Vec::with_capacity(3);
-    for (carrier, label) in CARRIERS {
-        let target = format!("{code}-{carrier}-v4.ip.zstaticcdn.com");
-        let mut sample = None;
-        let mut errors = Vec::new();
-        let mut success = 0;
-        for _ in 0..request.rounds {
-            match trace(binary, carrier, label, &target).await {
-                Ok(item) => {
-                    success += 1;
-                    sample.get_or_insert(item);
+    let mut items = Vec::with_capacity(6);
+    // V4 always runs; v6 only when asked for, after v4 finished, and only on a
+    // machine with a default IPv6 route -- otherwise the whole v6 phase is
+    // skipped rather than reported as three failures.
+    let stacks: &[(&str, &str)] =
+        if request.ipv6 && has_ipv6_route().await { &[("-4", "v4"), ("-6", "v6")] } else { &[("-4", "v4")] };
+    for (flag, stack) in stacks {
+        for (carrier, label) in CARRIERS {
+            let target = format!("{code}-{carrier}-{stack}.ip.zstaticcdn.com");
+            let mut sample = None;
+            let mut errors = Vec::new();
+            let mut success = 0;
+            for _ in 0..request.rounds {
+                match trace(binary, flag, stack, carrier, label, &target).await {
+                    Ok(item) => {
+                        success += 1;
+                        sample.get_or_insert(item);
+                    }
+                    Err(error) => errors.push(error.to_string()),
                 }
-                Err(error) => errors.push(error.to_string()),
             }
+            let item = sample
+                .map(|mut item| {
+                    item.success = success;
+                    item.rounds = request.rounds;
+                    item
+                })
+                .unwrap_or(RouteItem {
+                    stack,
+                    carrier,
+                    carrier_label: label,
+                    target,
+                    hops: Vec::new(),
+                    success: 0,
+                    rounds: request.rounds,
+                    error: Some(
+                        errors.pop().unwrap_or_else(|| "未知错误".into()).chars().take(240).collect(),
+                    ),
+                });
+            items.push(item);
         }
-        let item = sample
-            .map(|mut item| {
-                item.success = success;
-                item.rounds = request.rounds;
-                item
-            })
-            .unwrap_or(RouteItem {
-                carrier,
-                carrier_label: label,
-                target,
-                hops: Vec::new(),
-                success: 0,
-                rounds: request.rounds,
-                error: Some(errors.pop().unwrap_or_else(|| "未知错误".into()).chars().take(240).collect()),
-            });
-        items.push(item);
     }
     Ok(ResultMessage {
         request_id: request.request_id,
@@ -129,12 +144,32 @@ pub async fn run(request: Request) -> Result<ResultMessage> {
     })
 }
 
-async fn trace(binary: &str, carrier: &'static str, label: &'static str, target: &str) -> Result<RouteItem> {
+/// A default IPv6 route is what "this machine has v6" means here; the trace
+/// itself would only fail hop by hop, which reads as a broken line, not as
+/// "no v6". Machines without `ip` count as v4-only.
+async fn has_ipv6_route() -> bool {
+    Command::new("ip")
+        .args(["-6", "route", "show", "default"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map(|output| output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+async fn trace(
+    binary: &str,
+    flag: &str,
+    stack: &'static str,
+    carrier: &'static str,
+    label: &'static str,
+    target: &str,
+) -> Result<RouteItem> {
     let output = tokio::time::timeout(
         TRACE_TIMEOUT,
         Command::new(binary)
             .args([
-                "-4",
+                flag,
                 "-q",
                 "3",
                 "--parallel-requests",
@@ -159,6 +194,7 @@ async fn trace(binary: &str, carrier: &'static str, label: &'static str, target:
     let payload: Value = serde_json::from_slice(&output.stdout).context("invalid NextTrace JSON")?;
     let hops = successful_hops(&payload);
     Ok(RouteItem {
+        stack,
         carrier,
         carrier_label: label,
         target: target.into(),
@@ -169,12 +205,15 @@ async fn trace(binary: &str, carrier: &'static str, label: &'static str, target:
     })
 }
 
-/// One measured hop as the hub receives it: the address that answered and every
-/// AS number reported for it, in trace order. The hub owns the naming.
+/// One measured hop as the hub receives it: the address that answered, every AS
+/// number reported for it, and the place NextTrace geolocated it to, in trace
+/// order. The hub owns the naming.
 #[derive(Clone, Debug, Serialize)]
 pub struct RouteHop {
     pub ip: String,
     pub asns: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub region: String,
 }
 
 fn measured_hops(hops: &[Value]) -> Vec<RouteHop> {
@@ -182,9 +221,32 @@ fn measured_hops(hops: &[Value]) -> Vec<RouteHop> {
         .filter_map(|hop| {
             let ip = hop_ips(hop).into_iter().next().unwrap_or_default();
             let asns = hop_asns(hop);
-            (ip.len() >= 7 || !asns.is_empty()).then_some(RouteHop { ip, asns })
+            (ip.len() >= 7 || !asns.is_empty()).then_some(RouteHop { ip, asns, region: hop_region(hop) })
         })
         .collect()
+}
+
+/// The place a hop answered from, as the panel prints it: a Chinese province
+/// inside the mainland (浙江), the region itself for the likes of 香港/台湾
+/// that NextTrace files under country 中国, and the country everywhere else
+/// (美国 rather than 加利福尼亚州). Empty when nothing geolocated.
+fn hop_region(hop: &Value) -> String {
+    fn field(geo: &Value, key: &str) -> String {
+        geo.get(key).and_then(Value::as_str).unwrap_or("").trim().to_owned()
+    }
+    let geo = hop.get("Geo").unwrap_or(&Value::Null);
+    let region = {
+        let country = field(geo, "country");
+        let prov = field(geo, "prov");
+        if country == "中国" && !prov.is_empty() {
+            prov
+        } else if !country.is_empty() {
+            country
+        } else {
+            field(geo, "city")
+        }
+    };
+    region.chars().take(16).collect()
 }
 
 fn successful_hops(payload: &Value) -> Vec<Value> {
@@ -324,5 +386,35 @@ mod tests {
         assert_eq!(hops.len(), 2);
         assert_eq!(hops[0].asns, vec!["4134"]);
         assert_eq!(hops[1].ip, "203.0.113.1");
+    }
+
+    /// A mainland hop names its province, 香港 keeps its region although
+    /// NextTrace files it under country 中国, and everywhere else the country
+    /// is the label -- the panel prints 台湾-香港-浙江 style chains, not
+    /// 加利福尼亚州.
+    #[test]
+    fn regions_prefer_cn_province_then_region_then_country() {
+        let payload = serde_json::json!({"Hops": [
+            [{"Address": "202.97.96.1", "Geo": {"country": "中国", "prov": "浙江", "city": "杭州"}, "Success": true}],
+            [{"Address": "45.207.58.10", "Geo": {"country": "中国", "prov": "香港"}, "Success": true}],
+            [{"Address": "38.55.108.1", "Geo": {"country": "美国", "prov": "加利福尼亚州", "city": "洛杉矶"}, "Success": true}],
+            [{"Address": "203.0.113.7", "Geo": {}, "Success": true}],
+        ]});
+        let hops = measured_hops(&successful_hops(&payload));
+        assert_eq!(hops[0].region, "浙江");
+        assert_eq!(hops[1].region, "香港");
+        assert_eq!(hops[2].region, "美国");
+        assert_eq!(hops[3].region, "");
+    }
+
+    /// Hubs that predate the v6 flag keep working: `ipv6` defaults to false and
+    /// such a request traces v4 only.
+    #[test]
+    fn older_hubs_omit_ipv6_and_still_parse() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "request_id": "req-1", "province": "浙江", "rounds": 1
+        }))
+        .unwrap();
+        assert!(!request.ipv6);
     }
 }
