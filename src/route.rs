@@ -36,6 +36,11 @@ pub struct RouteItem {
     pub carrier_label: &'static str,
     pub target: String,
     pub hops: Vec<RouteHop>,
+    /// Every successful round's hops, shipped when more than one round
+    /// succeeded so the hub can vote the majority path; empty keeps the
+    /// single-round payload unchanged for older hubs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<Vec<RouteHop>>,
     pub success: u8,
     pub rounds: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,22 +108,23 @@ pub async fn run(request: Request) -> Result<ResultMessage> {
     for (flag, stack) in stacks {
         for (carrier, label) in CARRIERS {
             let target = format!("{code}-{carrier}-{stack}.ip.zstaticcdn.com");
-            let mut sample = None;
+            let mut successes = Vec::with_capacity(request.rounds as usize);
             let mut errors = Vec::new();
-            let mut success = 0;
             for _ in 0..request.rounds {
                 match trace(binary, flag, stack, carrier, label, &target).await {
-                    Ok(item) => {
-                        success += 1;
-                        sample.get_or_insert(item);
-                    }
+                    Ok(item) => successes.push(item),
                     Err(error) => errors.push(error.to_string()),
                 }
             }
-            let item = sample
-                .map(|mut item| {
-                    item.success = success;
+            let item = successes
+                .first()
+                .map(|first| {
+                    let mut item = first.clone();
+                    item.success = successes.len() as u8;
                     item.rounds = request.rounds;
+                    if successes.len() > 1 {
+                        item.samples = successes.iter().map(|s| s.hops.clone()).collect();
+                    }
                     item
                 })
                 .unwrap_or(RouteItem {
@@ -127,6 +133,7 @@ pub async fn run(request: Request) -> Result<ResultMessage> {
                     carrier_label: label,
                     target,
                     hops: Vec::new(),
+                    samples: Vec::new(),
                     success: 0,
                     rounds: request.rounds,
                     error: Some(
@@ -199,6 +206,7 @@ async fn trace(
         carrier_label: label,
         target: target.into(),
         hops: measured_hops(&hops),
+        samples: Vec::new(),
         success: 1,
         rounds: 1,
         error: None,
