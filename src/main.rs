@@ -350,17 +350,33 @@ async fn session(
                                 if route_test.as_ref().is_some_and(|task| !task.is_finished()) {
                                     eprintln!("route test ignored: one is already running");
                                 } else if let Ok(request) = serde_json::from_value::<route::Request>(rpc.params) {
+                                    eprintln!(
+                                        "route test {} started (province {}, {} round(s), ipv6 {})",
+                                        request.request_id, request.province, request.rounds, request.ipv6
+                                    );
                                     let tx = result_tx.clone();
                                     route_test = Some(tokio::spawn(async move {
                                         let request_id = request.request_id.clone();
                                         let province = request.province.clone();
                                         let rounds = request.rounds;
                                         let params = match route::run(request).await {
-                                            Ok(result) => serde_json::to_value(result).unwrap_or_default(),
-                                            Err(error) => serde_json::json!({
-                                                "request_id": request_id, "province": province, "rounds": rounds,
-                                                "items": [], "error": error.to_string().chars().take(240).collect::<String>()
-                                            }),
+                                            Ok(result) => {
+                                                let failed =
+                                                    result.items.iter().filter(|item| item.success == 0).count();
+                                                eprintln!(
+                                                    "route test {request_id} finished: {} item(s), \
+                                                     {failed} without a usable trace",
+                                                    result.items.len()
+                                                );
+                                                serde_json::to_value(result).unwrap_or_default()
+                                            }
+                                            Err(error) => {
+                                                eprintln!("route test {request_id} failed: {error}");
+                                                serde_json::json!({
+                                                    "request_id": request_id, "province": province, "rounds": rounds,
+                                                    "items": [], "error": error.to_string().chars().take(240).collect::<String>()
+                                                })
+                                            }
                                         };
                                         let _ = tx.send(notify("route.result", params)).await;
                                     }));
