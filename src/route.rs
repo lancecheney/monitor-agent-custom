@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 
-const TRACE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Eight queries per hop on a 25-hop path can crawl through dead stretches;
+/// 90s keeps the slowest real traces under the cap without hanging the agent.
+const TRACE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Request {
@@ -177,8 +179,17 @@ async fn trace(
         Command::new(binary)
             .args([
                 flag,
+                // TCP SYN on port 80 with a 1400-byte packet, NetQuality's
+                // combo: middle routers deprioritise ICMP and answer these
+                // more reliably, and eight queries per hop fill the gaps a
+                // three-query trace leaves as `*`.
+                "--tcp",
+                "-p",
+                "80",
+                "--psize",
+                "1400",
                 "-q",
-                "3",
+                "8",
                 "--parallel-requests",
                 "1",
                 "-m",
