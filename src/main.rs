@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use collect::Collector;
+use collect::{Collector, Facts};
 
 struct Args {
     server: String,
@@ -82,10 +82,13 @@ fn parse_args() -> Result<Args> {
 fn ws_url(server: &str, insecure: bool) -> Result<String> {
     let base = server.trim_end_matches('/');
     let scheme = if insecure { "ws" } else { "wss" };
-    let base = match base.split_once("://") {
-        Some(("https", rest)) => format!("wss://{rest}"),
-        Some(("http", rest)) => format!("ws://{rest}"),
-        Some(("wss" | "ws", _)) => base.to_owned(),
+    // Schemes are case-insensitive (RFC 3986), and a phone keyboard capitalises
+    // a hand-typed `Https://`; read as a bare host it would never resolve.
+    let (given, rest) = base.split_once("://").unwrap_or(("", base));
+    let base = match given.to_ascii_lowercase().as_str() {
+        "https" => format!("wss://{rest}"),
+        "http" => format!("ws://{rest}"),
+        ws @ ("wss" | "ws") => format!("{ws}://{rest}"),
         _ => format!("{scheme}://{base}"),
     };
     // RFC 3986 places userinfo before the host, so `127.0.0.1:28080@evil.example.com`
@@ -129,7 +132,7 @@ struct Rpc {
     params: serde_json::Value,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone)]
 struct PingTask {
     id: i64,
     target: String,
@@ -180,11 +183,25 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
-    // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
-    // filesystem the totals then omit it. The unit file owns that decision, but
-    // the discrepancy must not go unreported.
-    for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
-        eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+    // ProtectHome=yes and a user of its own, which keep some disks out of the
+    // totals. The unit file owns that decision, but the discrepancy must not go
+    // unreported. PID 1's table names every disk the sandbox hides; where /proc
+    // hides PID 1, this namespace's own table still shows a covered /home.
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    match std::fs::read_to_string("/proc/1/mounts") {
+        Ok(host) => {
+            for mount in collect::hidden_mounts(&host, &mounts) {
+                eprintln!("{mount} is not visible to this service and is not counted toward disk totals");
+            }
+        }
+        Err(_) => {
+            for mount in collect::shadowed_mounts(&mounts) {
+                eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+            }
+        }
+    }
+    for (mount, e) in collect::unreadable_mounts(&mounts) {
+        eprintln!("{mount} cannot be read ({e}) and is not counted toward disk totals");
     }
     let mut collector = Collector::new(args.ifaces);
     // Reported once at startup: an interface summed twice otherwise shows only
@@ -268,6 +285,13 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
+/// How often a session collects its facts again; a change goes out as another
+/// hello. An address added while connected, or one that arrived after the
+/// boot-time hello, would otherwise wait for the next reconnect, weeks away on
+/// a steady link. The hub writes at most one hello per half of this and holds
+/// the latest of any that arrive sooner, so none needs sending twice.
+const FACTS_RECHECK: Duration = Duration::from_secs(60);
+
 /// One connection: handshake, then report until the socket closes.
 async fn session(
     url: &str,
@@ -276,10 +300,7 @@ async fn session(
     interval: u64,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
-    let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    let request = authorized(url, token)?;
     let config =
         WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     let uri = request.uri();
@@ -293,7 +314,7 @@ async fn session(
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
     // Collected before dialing, as the v4 it reports decides which family is
     // tried first.
-    let facts = collector.facts();
+    let mut facts = collector.facts();
     let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
     let connect = async {
         let stream = dial(&host, port, behind_nat).await?;
@@ -308,23 +329,53 @@ async fn session(
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
+    let glimpse_from = |facts: &Facts| {
+        if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
+            tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
+        }
+    };
+    glimpse_from(&facts);
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    let mut hello = serde_json::to_value(&facts)?;
+    if let Some(fields) = hello.as_object_mut() {
+        fields.extend(collector.capacities().map(|(k, v)| (k.to_owned(), v.into())));
+    }
+    send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut route_test: Option<tokio::task::JoinHandle<()>> = None;
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+    // The baseline is taken a second before the first report, which then
+    // measures CPU and network over that second rather than over nothing --
+    // all a freshly started process has -- or over the outage since the
+    // previous session.
+    collector.collect();
+    let mut ticker =
+        tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut recheck = tokio::time::interval_at(Instant::now() + FACTS_RECHECK, FACTS_RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
+            }
+            _ = recheck.tick() => {
+                let fresh = collector.facts();
+                if fresh == facts {
+                    continue;
+                }
+                if (&fresh.ipv4, &fresh.ipv6) != (&facts.ipv4, &facts.ipv6) {
+                    glimpse_from(&fresh);
+                }
+                let hello = notify("hello", serde_json::to_value(&fresh)?);
+                if let Err(e) = send(&mut ws, hello, remaining(last_frame)).await { break Err(e); }
+                facts = fresh;
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
@@ -401,6 +452,97 @@ async fn session(
         handle.abort();
     }
     result
+}
+
+/// The upgrade request for `url`, carrying the node's token.
+fn authorized(url: &str, token: &str) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    Ok(request)
+}
+
+/// Which family a second connection is wanted in, as `v6`, given the one the
+/// session runs over and the addresses the interfaces hold. The session shows
+/// the hub one exit; for the other family it is wanted only where the interface
+/// holds a private address of it -- NAT66, a ULA behind a masquerading host --
+/// since a public one is reported as it is and none means nothing to connect
+/// from.
+fn glimpse_family(session_v6: bool, ipv4: &str, ipv6: &str) -> Option<bool> {
+    let held = if session_v6 { ipv4 } else { ipv6 };
+    held.parse::<std::net::IpAddr>().is_ok_and(|ip| !collect::is_public(ip)).then_some(!session_v6)
+}
+
+/// How long one attempt of [`glimpse`] may take. The session does not wait on
+/// it, so a path that cannot complete is abandoned well before
+/// [`CONNECT_DEADLINE`].
+const GLIMPSE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Attempts of [`glimpse`], and the wait between them. A session on a NAT66
+/// node can run for weeks, so one lost SYN or failed lookup would leave the hub
+/// without the exit until the next reconnect.
+const GLIMPSE_TRIES: u32 = 3;
+const GLIMPSE_RETRY: Duration = Duration::from_secs(30);
+
+/// How an attempt of [`glimpse`] ended once a connection was possible.
+enum Glimpse {
+    /// The hub took the connection, or has no address in that family.
+    Done,
+    /// The hub answered the handshake with a refusal: an older hub without the
+    /// route (404), or a proxy or firewall in front of it (403). Retrying
+    /// changes nothing.
+    Refused(u16),
+}
+
+/// The hub's echo route, from the session's URL.
+fn echo_url(session: &str) -> Result<String> {
+    let base = session.strip_suffix("/ws").context("server URL is not a session route")?;
+    Ok(format!("{base}/echo"))
+}
+
+/// Connects to the hub's echo route once over one address family, `v6` or v4,
+/// and drops the connection once it is upgraded. The hub learns the address this
+/// host exits at in that family from where the connection came, which an
+/// interface holding only a private address cannot tell it. Nothing is
+/// exchanged. Failures are logged and otherwise ignored: the session does not
+/// depend on this one.
+async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) {
+    let family = if v6 { "IPv6" } else { "IPv4" };
+    for attempt in 1..=GLIMPSE_TRIES {
+        match tokio::time::timeout(GLIMPSE_DEADLINE, echo_once(&url, &token, &host, port, v6)).await {
+            Ok(Ok(Glimpse::Done)) => return,
+            Ok(Ok(Glimpse::Refused(status))) => {
+                eprintln!("the hub answered {status} on its echo route over {family}; its exit there is not recorded");
+                return;
+            }
+            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
+            Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
+        }
+        if attempt < GLIMPSE_TRIES {
+            tokio::time::sleep(GLIMPSE_RETRY).await;
+        }
+    }
+}
+
+async fn echo_once(url: &str, token: &str, host: &str, port: u16, v6: bool) -> Result<Glimpse> {
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve {host}"))?
+        .filter(|a| a.is_ipv6() == v6)
+        .collect();
+    if addrs.is_empty() {
+        return Ok(Glimpse::Done);
+    }
+    let stream = connect_first(&addrs).await?;
+    let request = authorized(&echo_url(url)?, token)?;
+    match tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await {
+        Ok(_) => Ok(Glimpse::Done),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Ok(Glimpse::Refused(response.status().as_u16()))
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("handshake")),
+    }
 }
 
 /// Opens the TCP connection to the hub, trying its addresses in turn.
@@ -543,7 +685,8 @@ const MAX_PING_ADDRS: usize = 3;
 ///
 /// The name is resolved before the clock starts: `TcpStream::connect` on a
 /// hostname resolves first and connects second, which would fold resolver
-/// latency into every sample. glibc caches nothing, so this happens each round.
+/// latency into every sample. musl, which the release binaries link, keeps no
+/// cache, so this happens each round.
 ///
 /// ponytail: the `None` arm has no runtime reproduction; forcing it would
 /// require either a genuinely overrunning resolver or a test-only deadline
@@ -552,7 +695,7 @@ const MAX_PING_ADDRS: usize = 3;
 async fn tcp_ping(target: &str) -> Option<i32> {
     // Bounded by the handshake deadline: a resolution slower than a connect is
     // useless as a latency sample, and `lookup_host` has no deadline of its own
-    // -- glibc against a black-holed nameserver takes tens of seconds.
+    // -- musl waits five seconds on a black-holed nameserver.
     //
     // This does not cancel the underlying `getaddrinfo`, which runs to
     // completion on a blocking thread; it only keeps this probe on cadence.
@@ -570,9 +713,10 @@ async fn tcp_ping(target: &str) -> Option<i32> {
 /// The clock restarts on each address, so a dead one contributes nothing;
 /// summing them would report the accumulated wait as latency.
 ///
-/// Every failure advances to the next address, refusals included. glibc
-/// returns the v6 address first, and on a host whose v6 has no route stopping
-/// there would permanently report a target reachable over v4 as down.
+/// Every failure advances to the next address, refusals included. The
+/// resolver lists v6 first wherever the host has a v6 route, so stopping at
+/// the first failure would report a target reachable over v4 as down for as
+/// long as that route leads nowhere.
 async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32 {
     for address in addresses.take(MAX_PING_ADDRS) {
         let started = std::time::Instant::now();
@@ -609,6 +753,27 @@ mod tests {
     }
 
     #[test]
+    fn a_second_connection_is_wanted_only_for_a_private_address_in_the_other_family() {
+        // A v4 session: NAT66 or a ULA is worth asking about, a public v6 is
+        // reported as it is, and none leaves nothing to connect from.
+        assert_eq!(glimpse_family(false, "10.0.0.5", "fd00::5"), Some(true));
+        assert_eq!(glimpse_family(false, "203.0.113.5", "fd42::1"), Some(true));
+        assert_eq!(glimpse_family(false, "10.0.0.5", "2001:db8::5"), None);
+        assert_eq!(glimpse_family(false, "10.0.0.5", ""), None);
+        // A v6 session reached over a hub that has no v4 record, or whose v4 failed.
+        assert_eq!(glimpse_family(true, "10.0.0.5", "2001:db8::5"), Some(false));
+        assert_eq!(glimpse_family(true, "203.0.113.5", "2001:db8::5"), None);
+        assert_eq!(glimpse_family(true, "", "2001:db8::5"), None);
+    }
+
+    #[test]
+    fn the_echo_route_sits_beside_the_session_route() {
+        let session = ws_url("https://hub.example.com/", false).unwrap();
+        assert_eq!(echo_url(&session).unwrap(), "wss://hub.example.com/api/agent/echo");
+        assert!(echo_url("wss://hub.example.com/other").is_err());
+    }
+
+    #[test]
     fn ws_url_upgrades_scheme_and_refuses_plaintext_to_remote() {
         assert_eq!(ws_url("https://hub.example.com/", false).unwrap(), "wss://hub.example.com/api/agent/ws");
         assert_eq!(ws_url("http://127.0.0.1:28080", false).unwrap(), "ws://127.0.0.1:28080/api/agent/ws");
@@ -632,6 +797,11 @@ mod tests {
         assert!(ws_url("https://hub.example.com@evil.example.com/", false).is_err());
         // No token anywhere in the URL; it travels in a header.
         assert!(!ws_url("https://hub.example.com", false).unwrap().contains("token"));
+        // Already a WebSocket address, and any scheme in either case.
+        assert_eq!(ws_url("ws://127.0.0.1:1", false).unwrap(), "ws://127.0.0.1:1/api/agent/ws");
+        assert_eq!(ws_url("wss://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert_eq!(ws_url("HTTPS://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert!(ws_url("HTTP://hub.example.com", false).is_err(), "plaintext whatever its case");
     }
 
     /// `--insecure` covers a hub reached at ip:port with no TLS: it permits the
@@ -810,6 +980,13 @@ mod tests {
     }
 
     #[test]
+    fn the_token_travels_in_the_authorization_header_alone() {
+        let request = authorized("wss://hub.example.com/api/agent/ws", "s3cret").unwrap();
+        assert_eq!(request.headers()["authorization"], "Bearer s3cret");
+        assert!(!request.uri().to_string().contains("s3cret"));
+    }
+
+    #[test]
     fn ping_tasks_keep_their_timers_unless_the_task_changed() {
         // The runtime flavour the binary uses.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -821,6 +998,7 @@ mod tests {
         respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
         assert_eq!(running.len(), 2);
         let (first, second) = (running[0].1.id(), running[1].1.id());
+        let replaced = running[1].1.abort_handle();
 
         // Task 1 unchanged, task 2 retargeted, task 3 added.
         respawn_ping_tasks(
@@ -833,6 +1011,9 @@ mod tests {
         // A task whose target changed must be torn down, or it keeps probing
         // the old address.
         assert_ne!(running[1].1.id(), second, "a retargeted task must be restarted");
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert!(replaced.is_finished(), "the old one is stopped, not left probing beside it");
+        assert!(!running[0].1.is_finished(), "the unchanged one keeps running");
 
         // Interval 0 must not take the probe down: tokio's interval panics on
         // a zero period, and a panicked task stops reporting silently.

@@ -383,13 +383,6 @@ fn hop_ips(hop: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn hops(values: &[(&str, &str)]) -> Vec<Value> {
-        values
-            .iter()
-            .map(|(ip, asn)| serde_json::json!({"Address": ip, "Geo": {"asnumber": asn}, "Success": true}))
-            .collect()
-    }
-
     #[test]
     fn province_targets_are_fixed() {
         assert!(valid_province("浙江"));

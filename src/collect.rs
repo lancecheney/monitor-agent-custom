@@ -27,9 +27,9 @@ use serde::Serialize;
 /// from a container's only link -- an LXC guest's veth, the tap of a rootless
 /// container's pasta network -- and a guest counted as virtual would report no
 /// traffic at all. Bridge ports and other tunnels are recognised by
-/// [`counted_elsewhere`] whatever their name; the tunnel entries here also keep
-/// their addresses out of [`addresses`]. `--iface` covers whatever neither
-/// catches.
+/// [`counted_elsewhere`] whatever their name; the entries here also keep their
+/// addresses out of [`addresses`], see [`lends_address`]. `--iface` covers
+/// whatever neither catches.
 const SKIP_IFACES: &[&str] = &[
     "lo",
     "docker",
@@ -98,7 +98,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "9p",
 ];
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, PartialEq)]
 pub struct Facts {
     pub hostname: String,
     pub os: String,
@@ -107,9 +107,6 @@ pub struct Facts {
     pub virt: String,
     pub cpu_name: String,
     pub cpu_cores: u32,
-    pub mem_total: u64,
-    pub swap_total: u64,
-    pub disk_total: u64,
     pub agent_version: String,
     /// The host's own addresses, public ones first; see [`pick`]. The hub sees
     /// only the family the agent connected over.
@@ -117,7 +114,7 @@ pub struct Facts {
     pub ipv6: String,
 }
 
-#[derive(Serialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize)]
 pub struct Metrics {
     /// Names the span over which `net_rx_total` and `net_tx_total` readings
     /// are comparable. The hub only tests it for equality, and a change makes
@@ -139,8 +136,9 @@ pub struct Metrics {
     pub swap_used: u64,
     pub disk_total: u64,
     pub disk_used: u64,
-    /// Kernel lifetime byte counters. The hub accumulates these; the agent
-    /// stores nothing and does not attempt to survive a reboot.
+    /// The counted interfaces' lifetime byte counters, summed. The hub
+    /// accumulates these; the agent stores nothing and does not attempt to
+    /// survive a reboot.
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     pub net_rx: u64,
@@ -179,7 +177,7 @@ impl Ifaces {
             };
             // Rejected rather than left to match nothing or everything: each
             // would silently change the totals. install.sh and the panel refuse
-            // the same entries.
+            // these too, and admit only letters, digits, `.`, `_` and `-`.
             if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
                 return Err(format!(
                     "--iface: {entry:?} is not an interface name; give full names separated by commas"
@@ -247,11 +245,24 @@ impl Collector {
         net_dev(dev).filter(|(name, ..)| self.ifaces.counts(Path::new(SYS_NET), name)).collect()
     }
 
+    /// Memory, swap and disk totals as a report carries them, for the first
+    /// hello of a session alone. A hub that stores the capacities from the
+    /// hello -- one from 1.3 or earlier never takes them from a report --
+    /// would otherwise record zeros. They stay out of [`Facts`], which a
+    /// session resends whenever it differs, and a total that floats with
+    /// writes, as on ZFS, would resend it every minute.
+    pub fn capacities(&self) -> [(&'static str, u64); 3] {
+        let mem = meminfo();
+        [
+            ("mem_total", mem_used(&mem).0),
+            ("swap_total", swap_used(&mem).0),
+            ("disk_total", disk_usage(&real_mount_points()).0),
+        ]
+    }
+
     pub fn facts(&self) -> Facts {
         let (v4, v6) = addresses();
-        let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&real_mount_points());
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -260,9 +271,6 @@ impl Collector {
             virt: virtualization(),
             cpu_name,
             cpu_cores,
-            mem_total: mem.get("MemTotal").copied().unwrap_or(0),
-            swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
-            disk_total,
             agent_version: env!("CARGO_PKG_VERSION").into(),
             ipv4: v4,
             ipv6: v6,
@@ -320,7 +328,7 @@ impl Collector {
     /// Per interface, over those in both samples: one joining brings a lifetime
     /// counter that is not this interval's traffic, and one whose counter
     /// restarted moved backwards. Either would otherwise read as a burst in the
-    /// history. Kept in memory only; a restarted agent reports no rate once.
+    /// history. Kept in memory only.
     fn net_rate(&mut self, counted: &[(&str, u64, u64)], now: Instant) -> (u64, u64) {
         let rate = match self.prev_net_at {
             Some(t) => {
@@ -346,7 +354,7 @@ impl Collector {
     }
 }
 
-fn read_trim(path: &str) -> Option<String> {
+fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
 }
 
@@ -365,7 +373,8 @@ fn parse_meminfo(text: &str) -> HashMap<String, u64> {
         .collect()
 }
 
-/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate.
+/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate, or
+/// minus MemFree where the estimate exceeds the total.
 /// sysinfo's `used_memory()` counts page cache as used and reads gigabytes high
 /// on a host that has been up for a while.
 fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
@@ -379,6 +388,10 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
     // would understate used memory precisely when it matters.
     let available =
         m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
+    // Above the total, as LXCFS can report it, procps-ng 4 discards the estimate
+    // and `free` shows total - MemFree; subtracting it would report 0. The
+    // fallback sum is held to the same bound.
+    let available = if available > total { g("MemFree") } else { available };
     (total, total.saturating_sub(available))
 }
 
@@ -441,7 +454,7 @@ fn uptime() -> u64 {
 /// which is what the machine actually holds -- no external service is
 /// consulted.
 ///
-/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
+/// Filtered by [`lends_address`], so a docker bridge cannot pass for the
 /// machine's address. [`is_stacked`] is not applied here: it answers whether
 /// bytes were already counted lower down, and a bridge holding the host address
 /// is both stacked and this machine.
@@ -450,10 +463,27 @@ fn addresses() -> (String, String) {
     let held: Vec<IpAddr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| !skip_iface(&i.name) && !i.is_link_local() && i.is_oper_up())
+        .filter(|i| lends_address(&i.name, i.ip()) && !i.is_link_local() && i.is_oper_up())
         .map(|i| i.ip())
         .collect();
     pick(&held, &transient)
+}
+
+/// Whether an address on this interface may be the machine's own. A skipped
+/// interface lends none: its addresses belong to the containers, guests or
+/// overlay behind it. WireGuard is the exception for a public v6, since a
+/// machine without IPv6 of its own gets a routed prefix through one. VPN
+/// clients' own addresses are private, CGNAT or ULA, which [`is_public`]
+/// rejects. Cloudflare WARP is the one that is not: it puts a global
+/// 2606:4700::/32 address on the tunnel, shared by every user of the service
+/// and not reachable from outside. That range is left out on every interface,
+/// whatever the script setting up the tunnel named it -- `wgcf`, `warp`,
+/// `CloudflareWARP` -- since only Cloudflare's own machines hold it natively.
+fn lends_address(name: &str, ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) if v6.segments()[..2] == [0x2606, 0x4700] => false,
+        _ => !skip_iface(name) || (name.starts_with("wg") && ip.is_ipv6() && is_public(ip)),
+    }
 }
 
 /// A public address before any other, then a stable v6 before a transient
@@ -495,8 +525,8 @@ fn transient_v6(text: &str) -> Vec<Ipv6Addr> {
 /// themselves), multicast and reserved. On the v6 side only 2000::/3 counts,
 /// which leaves out ULA (fc00::/7), link-local and loopback.
 ///
-/// The hub and its panel apply the same ranges to the addresses this agent
-/// reports; the three lists are to be changed together.
+/// The hub applies the same ranges to the addresses this agent reports; the two
+/// lists are to be changed together.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -641,17 +671,23 @@ fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
 }
 
 fn parse_mounts(text: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
+    real_mounts(text).into_iter().map(|(_, mount)| mount).collect()
+}
+
+/// [`parse_mounts`] with the key each point was deduplicated by: the source
+/// device, or a ZFS pool.
+fn real_mounts(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     let rows = mount_rows(text);
+    // The table is in mount order and a path resolves to the last mount on it,
+    // which is what statvfs below answers for. An earlier entry for the same
+    // point remains listed but is no longer reachable: under ProtectHome=yes a
+    // host whose /home is its own filesystem has that row sitting beneath a
+    // tmpfs, and counting it would book the tmpfs's size as /home's. Indexed
+    // once, as a Kubernetes node lists several mounts per pod.
+    let top: HashMap<&str, usize> = rows.iter().enumerate().map(|(i, &(_, mount, _))| (mount, i)).collect();
     for (i, &(dev, mount, fstype)) in rows.iter().enumerate() {
-        // The table is in mount order and a path resolves to the last mount on
-        // it, which is what statvfs below answers for. An earlier entry for the
-        // same point remains listed but is no longer reachable: under
-        // ProtectHome=yes a host whose /home is its own filesystem has that row
-        // sitting beneath a tmpfs, and counting it would book the tmpfs's size
-        // as /home's.
-        if rows[i + 1..].iter().any(|(_, m, _)| *m == mount) {
+        if top[mount] != i {
             continue;
         }
         if skip_fstype(fstype) {
@@ -661,12 +697,11 @@ fn parse_mounts(text: &str) -> Vec<String> {
             continue;
         }
         // ZFS datasets and btrfs subvolumes share one pool's free space.
-        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev).to_owned();
-        if seen.contains(&key) {
+        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev);
+        if out.iter().any(|(k, _)| k == key) {
             continue;
         }
-        seen.push(key);
-        out.push(mount.replace("\\040", " "));
+        out.push((key.to_owned(), mount.replace("\\040", " ")));
     }
     out
 }
@@ -677,8 +712,8 @@ fn parse_mounts(text: &str) -> Vec<String> {
 ///
 /// The `install.sh` unit sets `ProtectHome=yes`, which mounts a tmpfs over
 /// /home. Where /home is its own filesystem, `df` on the host and the panel then
-/// disagree by its entire size. Reported once at startup, since the discrepancy
-/// is otherwise visible only in the totals themselves.
+/// disagree by its entire size. Reported at startup in place of
+/// [`hidden_mounts`] where PID 1's table cannot be read.
 pub fn shadowed_mounts(text: &str) -> Vec<String> {
     let rows = mount_rows(text);
     rows.iter()
@@ -692,6 +727,28 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
                     .is_some_and(|(_, _, top)| skip_fstype(top))
         })
         .map(|(_, (_, mount, _))| mount.replace("\\040", " "))
+        .collect()
+}
+
+/// Real filesystems the host mounts that this mount namespace cannot reach,
+/// given the tables of PID 1 and of this process. `ProtectHome=yes` drops every
+/// mount beneath /root and /home from the agent's namespace and covers a
+/// separate /home, so `df` as root counts disks the agent never sees. Compared
+/// by device, so a disk hidden at one point and reachable at another counts as
+/// reachable.
+pub fn hidden_mounts(host: &str, own: &str) -> Vec<String> {
+    let reachable: Vec<String> = real_mounts(own).into_iter().map(|(dev, _)| dev).collect();
+    real_mounts(host).into_iter().filter(|(dev, _)| !reachable.contains(dev)).map(|(_, m)| m).collect()
+}
+
+/// Mount points in this namespace that `statvfs` refuses, with the reason,
+/// which [`disk_usage`] skips while `df` as root counts them: under the
+/// `install.sh` unit the agent runs as its own user, so a disk mounted below a
+/// directory closed to other users is one of these.
+pub fn unreadable_mounts(text: &str) -> Vec<(String, rustix::io::Errno)> {
+    parse_mounts(text)
+        .into_iter()
+        .filter_map(|m| rustix::fs::statvfs(m.as_str()).err().map(|e| (m, e)))
         .collect()
 }
 
@@ -765,52 +822,334 @@ fn cpuinfo() -> (String, u32) {
             let (k, v) = l.split_once(':')?;
             matches!(k.trim(), "model name" | "Model" | "cpu model").then(|| v.trim().to_owned())
         })
+        .or_else(|| arm_cpu_name(&text))
         .unwrap_or_else(|| "unknown".into());
     let cores = text.lines().filter(|l| l.starts_with("processor")).count().max(1) as u32;
     (name, cores)
 }
 
+/// AArch64 cores by MIDR implementer and part, under the names util-linux's
+/// `lscpu-arm.c` gives them. 32-bit Arm cores and the Cortex-M and Cortex-R
+/// microcontroller cores are left out.
+const ARM_CPUS: &[(u32, &str, Parts)] = &[
+    (
+        0x41,
+        "ARM",
+        &[
+            (0xd02, "Cortex-A34"),
+            (0xd03, "Cortex-A53"),
+            (0xd04, "Cortex-A35"),
+            (0xd05, "Cortex-A55"),
+            (0xd06, "Cortex-A65"),
+            (0xd07, "Cortex-A57"),
+            (0xd08, "Cortex-A72"),
+            (0xd09, "Cortex-A73"),
+            (0xd0a, "Cortex-A75"),
+            (0xd0b, "Cortex-A76"),
+            (0xd0c, "Neoverse-N1"),
+            (0xd0d, "Cortex-A77"),
+            (0xd0e, "Cortex-A76AE"),
+            (0xd40, "Neoverse-V1"),
+            (0xd41, "Cortex-A78"),
+            (0xd42, "Cortex-A78AE"),
+            (0xd43, "Cortex-A65AE"),
+            (0xd44, "Cortex-X1"),
+            (0xd46, "Cortex-A510"),
+            (0xd47, "Cortex-A710"),
+            (0xd48, "Cortex-X2"),
+            (0xd49, "Neoverse-N2"),
+            (0xd4a, "Neoverse-E1"),
+            (0xd4b, "Cortex-A78C"),
+            (0xd4c, "Cortex-X1C"),
+            (0xd4d, "Cortex-A715"),
+            (0xd4e, "Cortex-X3"),
+            (0xd4f, "Neoverse-V2"),
+            (0xd80, "Cortex-A520"),
+            (0xd81, "Cortex-A720"),
+            (0xd82, "Cortex-X4"),
+            (0xd83, "Neoverse-V3AE"),
+            (0xd84, "Neoverse-V3"),
+            (0xd85, "Cortex-X925"),
+            (0xd87, "Cortex-A725"),
+            (0xd88, "Cortex-A520AE"),
+            (0xd89, "Cortex-A720AE"),
+            (0xd8a, "C1-Nano"),
+            (0xd8b, "C1-Pro"),
+            (0xd8c, "C1-Ultra"),
+            (0xd8e, "Neoverse-N3"),
+            (0xd8f, "Cortex-A320"),
+            (0xd90, "C1-Premium"),
+        ],
+    ),
+    (0x42, "Broadcom", &[(0x100, "Brahma-B53"), (0x516, "ThunderX2")]),
+    (
+        0x43,
+        "Cavium",
+        &[
+            (0x0a0, "ThunderX"),
+            (0x0a1, "ThunderX-88XX"),
+            (0x0a2, "ThunderX-81XX"),
+            (0x0a3, "ThunderX-83XX"),
+            (0x0af, "ThunderX2-99xx"),
+            (0x0b0, "OcteonTX2"),
+            (0x0b1, "OcteonTX2-98XX"),
+            (0x0b2, "OcteonTX2-96XX"),
+            (0x0b3, "OcteonTX2-95XX"),
+            (0x0b4, "OcteonTX2-95XXN"),
+            (0x0b5, "OcteonTX2-95XXMM"),
+            (0x0b6, "OcteonTX2-95XXO"),
+            (0x0b8, "ThunderX3-T110"),
+        ],
+    ),
+    (0x46, "FUJITSU", &[(0x001, "A64FX"), (0x003, "MONAKA")]),
+    (
+        0x48,
+        "HiSilicon",
+        &[
+            (0xd01, "Kunpeng-920"),
+            (0xd02, "Kunpeng-920"),
+            (0xd03, "Kunpeng-920"),
+            (0xd06, "Kunpeng-950"),
+            (0xd22, "Kunpeng-920"),
+            (0xd40, "Cortex-A76"),
+            (0xd41, "Cortex-A77"),
+        ],
+    ),
+    (0x4e, "NVIDIA", &[(0x000, "Denver"), (0x003, "Denver-2"), (0x004, "Carmel"), (0x010, "Olympus")]),
+    (0x50, "APM", &[(0x000, "X-Gene")]),
+    (
+        0x51,
+        "Qualcomm",
+        &[
+            (0x001, "Oryon"),
+            (0x002, "Oryon-2"),
+            (0x201, "Kryo"),
+            (0x205, "Kryo"),
+            (0x211, "Kryo"),
+            (0x800, "Falkor-V1/Kryo"),
+            (0x801, "Kryo-V2"),
+            (0x802, "Kryo-3XX-Gold"),
+            (0x803, "Kryo-3XX-Silver"),
+            (0x804, "Kryo-4XX-Gold"),
+            (0x805, "Kryo-4XX-Silver"),
+            (0xc00, "Falkor"),
+            (0xc01, "Saphira"),
+        ],
+    ),
+    (
+        0x53,
+        "Samsung",
+        &[(0x001, "exynos-m1"), (0x002, "exynos-m3"), (0x003, "exynos-m4"), (0x004, "exynos-m5")],
+    ),
+    (
+        0x61,
+        "Apple",
+        &[
+            (0x022, "Icestorm-M1"),
+            (0x023, "Firestorm-M1"),
+            (0x024, "Icestorm-M1-Pro"),
+            (0x025, "Firestorm-M1-Pro"),
+            (0x028, "Icestorm-M1-Max"),
+            (0x029, "Firestorm-M1-Max"),
+            (0x032, "Blizzard-M2"),
+            (0x033, "Avalanche-M2"),
+            (0x034, "Blizzard-M2-Pro"),
+            (0x035, "Avalanche-M2-Pro"),
+            (0x038, "Blizzard-M2-Max"),
+            (0x039, "Avalanche-M2-Max"),
+        ],
+    ),
+    (0x6d, "Microsoft", &[(0xd49, "Azure-Cobalt-100")]),
+    (
+        0x70,
+        "Phytium",
+        &[
+            (0x303, "FTC310"),
+            (0x660, "FTC660"),
+            (0x661, "FTC661"),
+            (0x662, "FTC662"),
+            (0x663, "FTC663"),
+            (0x664, "FTC664"),
+            (0x862, "FTC862"),
+        ],
+    ),
+    (0xc0, "Ampere", &[(0xac3, "Ampere-1"), (0xac4, "Ampere-1a")]),
+];
+
+/// One implementer's parts, by MIDR part number.
+type Parts = &'static [(u32, &'static str)];
+
+/// The name of an AArch64 CPU, decoded as lscpu does it, since its /proc/cpuinfo
+/// carries no name, only each core's `CPU implementer` and `CPU part`. Every
+/// distinct core type is named once, in order, so a big.LITTLE chip reads as
+/// `Cortex-A55/Cortex-A76` rather than as its first cluster. The types are
+/// joined by `/`, not `+`: displays append ` × <cores>`, and
+/// `Cortex-A55 + Cortex-A76 × 8` reads as eight A76 cores. A part missing
+/// from [`ARM_CPUS`] takes its implementer's name; an unlisted implementer
+/// yields `None`.
+fn arm_cpu_name(text: &str) -> Option<String> {
+    let hex = |v: &str| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+    let mut vendor = None;
+    let mut names: Vec<&str> = Vec::new();
+    for (key, value) in text.lines().filter_map(|l| l.split_once(':')) {
+        match key.trim() {
+            "CPU implementer" => vendor = hex(value).and_then(|id| ARM_CPUS.iter().find(|(v, ..)| *v == id)),
+            "CPU part" => {
+                let Some((_, vendor, parts)) = vendor else { continue };
+                let part = hex(value);
+                let name = parts.iter().find(|(p, _)| Some(*p) == part).map_or(*vendor, |(_, n)| *n);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!names.is_empty()).then(|| names.join("/"))
+}
+
+/// os-release(5): /etc/os-release where it exists, /usr/lib/os-release
+/// otherwise. A value may be quoted either way.
 fn os_pretty_name() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
         .and_then(|t| {
-            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
+            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches(['"', '\'']).to_owned()))
         })
         .unwrap_or_else(|| "Linux".into())
 }
 
+/// The virtualization this system runs under, `none` on bare metal. A
+/// container is named rather than the machine whose kernel it shares.
 fn virtualization() -> String {
-    if fs::metadata("/proc/vz").is_ok() {
-        return "openvz".into();
+    let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    container(Path::new("/"), &mounts)
+        .or_else(|| hypervisor().map(Into::into))
+        .unwrap_or_else(|| "none".into())
+}
+
+/// The container this system is, judged from what an unprivileged process
+/// can read: the agent runs as its own user, to whom PID 1's environment is
+/// closed.
+///
+/// - OpenVZ: /proc/vz without the /proc/bc that only the host has.
+/// - Whatever systemd, as PID 1 in a container, recorded in
+///   /run/systemd/container: `lxc`, `docker`, `podman`, `systemd-nspawn`.
+/// - The files Docker and Podman place in each container.
+/// - LXCFS mounted over /proc, as Proxmox and LXD give their containers. This
+///   covers an LXC guest booted by OpenRC, which records nothing; the host
+///   mounts LXCFS elsewhere.
+fn container(root: &Path, mounts: &str) -> Option<String> {
+    let has = |path: &str| root.join(path).exists();
+    if has("proc/vz") && !has("proc/bc") {
+        return Some("openvz".into());
     }
-    if fs::metadata("/proc/xen").is_ok() {
-        return "xen".into();
+    if let Some(name) = read_trim(root.join("run/systemd/container")).filter(|n| !n.is_empty()) {
+        return Some(name);
     }
-    if fs::metadata("/.dockerenv").is_ok() {
-        return "docker".into();
+    if has(".dockerenv") {
+        return Some("docker".into());
     }
-    if let Some(t) = read_trim("/sys/hypervisor/type") {
-        return t.to_lowercase();
+    if has("run/.containerenv") {
+        return Some("podman".into());
     }
-    for path in ["/sys/class/dmi/id/product_name", "/sys/class/dmi/id/sys_vendor"] {
-        let Some(v) = read_trim(path) else { continue };
-        let l = v.to_lowercase();
-        for k in ["kvm", "vmware", "virtualbox", "qemu", "hyper-v", "xen", "bochs", "amazon", "google"] {
-            if l.contains(k) {
-                return k.into();
-            }
-        }
+    mount_rows(mounts)
+        .iter()
+        .any(|&(_, mount, fstype)| fstype == "fuse.lxcfs" && mount.starts_with("/proc/"))
+        .then(|| "lxc".into())
+}
+
+/// The hypervisor beneath this system, `None` on bare metal. Xen is asked
+/// first: a PV guest has no CPUID signature, and an HVM guest that offers
+/// Windows the Hyper-V interface presents Microsoft's.
+fn hypervisor() -> Option<&'static str> {
+    if Path::new("/proc/xen").exists() || Path::new("/sys/hypervisor/type").exists() {
+        return Some("xen");
     }
-    if fs::read_to_string("/proc/cpuinfo").is_ok_and(|t| t.contains("hypervisor")) {
-        "vm".into()
-    } else {
-        "none".into()
+    platform_hypervisor()
+}
+
+/// An x86 hypervisor names itself in CPUID leaf 0x40000000, behind the
+/// hypervisor bit of leaf 1. A KVM guest reads `kvm` that way, or Microsoft's
+/// signature if it is offered the Hyper-V interface. Its DMI strings are the
+/// provider's to choose -- `KVM`, `QEMU`, `Bochs`, `Alibaba Cloud ECS` -- and
+/// would name one hypervisor several ways. A hypervisor that clears the bit
+/// leaves its guest reported as bare metal.
+#[cfg(target_arch = "x86_64")]
+fn platform_hypervisor() -> Option<&'static str> {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx >> 31 == 0 {
+        return None;
     }
+    let leaf = __cpuid(0x4000_0000);
+    let mut signature = [0; 12];
+    for (bytes, reg) in signature.chunks_mut(4).zip([leaf.ebx, leaf.ecx, leaf.edx]) {
+        bytes.copy_from_slice(&reg.to_le_bytes());
+    }
+    Some(match &signature {
+        b"KVMKVMKVM\0\0\0" | b"Linux KVM Hv" => "kvm",
+        b"TCGTCGTCGTCG" => "qemu",
+        b"Microsoft Hv" => "hyper-v",
+        b"VMwareVMware" => "vmware",
+        b"VBoxVBoxVBox" => "virtualbox",
+        b"XenVMMXenVMM" => "xen",
+        b"bhyve bhyve " => "bhyve",
+        _ => "vm",
+    })
+}
+
+/// Without CPUID, QEMU's fw_cfg device marks a QEMU machine whatever its DMI
+/// strings say, and is reported as KVM: no provider runs aarch64 guests on the
+/// emulator alone. Clouds that run no QEMU name themselves in DMI, and each
+/// maps to its hypervisor: Nitro and Compute Engine are KVM, Azure is Hyper-V.
+///
+/// ponytail: a provider's bare-metal instance carries the same DMI vendor and
+/// reads as its hypervisor. Telling the two apart takes the SMBIOS
+/// virtual-machine bit, which only root can read.
+#[cfg(not(target_arch = "x86_64"))]
+fn platform_hypervisor() -> Option<&'static str> {
+    if Path::new("/sys/bus/acpi/devices/QEMU0002:00").exists() {
+        return Some("kvm");
+    }
+    let dmi = ["product_name", "sys_vendor"]
+        .map(|f| read_trim(format!("/sys/class/dmi/id/{f}")).unwrap_or_default().to_lowercase())
+        .join(" ");
+    [
+        ("kvm", "kvm"),
+        ("qemu", "kvm"),
+        ("amazon ec2", "kvm"),
+        ("google", "kvm"),
+        ("microsoft", "hyper-v"),
+        ("vmware", "vmware"),
+    ]
+    .into_iter()
+    .find_map(|(word, name)| dmi.contains(word).then_some(name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path under the temp directory, cleared of whatever a killed run under
+    /// the same PID left there, and removed with everything in it when dropped,
+    /// so a failing test leaves nothing behind either. A mutation run fails
+    /// thousands of them.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("monitor-agent-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn memory_matches_free_not_sysinfo() {
@@ -846,6 +1185,13 @@ mod tests {
     }
 
     #[test]
+    fn memory_ignores_a_memavailable_above_the_total() {
+        // `free` from procps-ng 4.0.4 on this /proc/meminfo shows used 700000.
+        let m = parse_meminfo("MemTotal: 1000000 kB\nMemFree: 300000 kB\nMemAvailable: 1200000 kB\n");
+        assert_eq!(mem_used(&m), (1000000 * 1024, 700000 * 1024));
+    }
+
+    #[test]
     fn cpu_percent_needs_a_baseline_then_uses_deltas() {
         assert_eq!(parse_cpu_jiffies("cpu  40 0 35 925 0 0 0 0 0 0\n"), Some((1000, 925)));
         // The last two columns are guest and guest_nice, already counted in
@@ -872,6 +1218,29 @@ mod tests {
         // held in the v4 `tw` field for both families.
         assert_eq!(parse_sockstat(v4, v6), (86, 6));
         assert_eq!(parse_sockstat("", ""), (0, 0));
+    }
+
+    /// An aarch64 /proc/cpuinfo names no model, so the name is looked up the way
+    /// lscpu does it. The part number is scoped by its implementer: HiSilicon
+    /// reuses ARM's 0xd40, which ARM assigns to Neoverse-V1.
+    #[test]
+    fn an_arm_cpu_is_named_from_its_implementer_and_part() {
+        let core = |implementer: u32, part: u32| {
+            format!("processor\t: 0\nCPU implementer\t: {implementer:#x}\nCPU part\t: {part:#x}\n")
+        };
+        // Oracle Cloud's Ampere Altra, as its guests see it.
+        let altra = "processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\n\
+                     CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x3\nCPU part\t: 0xd0c\nCPU revision\t: 1\n";
+        assert_eq!(arm_cpu_name(altra).as_deref(), Some("Neoverse-N1"));
+        assert_eq!(arm_cpu_name(&core(0x41, 0xd40)).as_deref(), Some("Neoverse-V1"));
+        assert_eq!(arm_cpu_name(&core(0x48, 0xd40)).as_deref(), Some("Cortex-A76"));
+        // RK3588: four little cores listed first, then four big ones.
+        let rk3588 = [core(0x41, 0xd05), core(0x41, 0xd05), core(0x41, 0xd0b), core(0x41, 0xd0b)].concat();
+        assert_eq!(arm_cpu_name(&rk3588).as_deref(), Some("Cortex-A55/Cortex-A76"));
+        // A core newer than the table still names its maker.
+        assert_eq!(arm_cpu_name(&core(0xc0, 0xac5)).as_deref(), Some("Ampere"));
+        assert_eq!(arm_cpu_name(&core(0x99, 0xd0c)), None, "an unknown implementer names nothing");
+        assert_eq!(arm_cpu_name("processor\t: 0\nmodel name\t: AMD EPYC 7763 64-Core Processor\n"), None);
     }
 
     /// Totals over constructed /proc/net/dev text, with no sysfs to consult.
@@ -920,8 +1289,9 @@ mod tests {
             assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
             assert!(!skip_iface(name), "{name} is where a host address lives");
         }
-        // Neither this machine's traffic nor its address: container networks,
-        // and tunnels whose payload leaves inside a packet eth0 has counted.
+        // Not this machine's traffic: container networks, and tunnels whose
+        // payload leaves inside a packet eth0 has counted. Their addresses are
+        // lent only as [`lends_address`] allows.
         for name in [
             "lo",
             "docker0",
@@ -955,9 +1325,8 @@ mod tests {
     /// master but is no bridge's port.
     #[test]
     fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
-        let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
-        // Left behind by a failed run under a reused PID.
-        let _ = fs::remove_dir_all(&sys);
+        let tmp = TempDir::new("sys");
+        let sys = tmp.0.clone();
         for (name, ty, extra) in [
             ("he-ipv6", 776, &[][..]),
             ("nebula1", 65534, &[]),
@@ -994,7 +1363,36 @@ mod tests {
         for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "up1", "absent0"] {
             assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
         }
-        fs::remove_dir_all(&sys).unwrap();
+    }
+
+    /// Each kind of container as an unprivileged process sees it. The host of
+    /// each kind shows part of the same picture -- /proc/vz beside /proc/bc,
+    /// LXCFS mounted outside /proc -- and is no container.
+    #[test]
+    fn a_container_is_named_from_what_an_unprivileged_process_can_read() {
+        let tmp = TempDir::new("root");
+        let root = tmp.0.clone();
+        let lxcfs = "lxcfs /proc/meminfo fuse.lxcfs rw,nosuid,nodev 0 0\n";
+        let lxcfs_host = "lxcfs /var/lib/lxcfs fuse.lxcfs rw,nosuid,nodev 0 0\n";
+        for (files, mounts, expected) in [
+            (&["proc/vz"][..], "", Some("openvz")),
+            (&["proc/vz", "proc/bc"], "", None),
+            (&["run/systemd/container=lxc\n"], "", Some("lxc")),
+            (&[".dockerenv"], "", Some("docker")),
+            (&["run/.containerenv"], "", Some("podman")),
+            (&[], lxcfs, Some("lxc")),
+            (&[], lxcfs_host, None),
+            (&[], "", None),
+        ] {
+            // Left behind by the last case.
+            let _ = fs::remove_dir_all(&root);
+            for file in files {
+                let (path, content) = file.split_once('=').unwrap_or((file, ""));
+                fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                fs::write(root.join(path), content).unwrap();
+            }
+            assert_eq!(container(&root, mounts).as_deref(), expected, "{files:?} {mounts:?}");
+        }
     }
 
     /// A router forwards each byte across two real NICs, so only its owner can
@@ -1023,6 +1421,16 @@ mod tests {
         for bad in ["eth0 eth1", "-", "eth0,-", "--eth0"] {
             assert!(Ifaces::parse(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    /// The panel's reinstall dialog starts from the filter a node reports, so
+    /// the report carries the one in force: trimmed, empty entries dropped, in
+    /// the order given. The panel splits it into its two lists, so the order
+    /// carries no meaning.
+    #[test]
+    fn the_report_names_the_filter_in_force() {
+        let ifaces = Ifaces::parse(" wan , -eth0 , lan ,").unwrap();
+        assert_eq!(Collector::new(ifaces).collect().iface, "wan,-eth0,lan");
     }
 
     /// Any change to which interfaces are summed, within one boot, must make the
@@ -1080,6 +1488,30 @@ mod tests {
         assert_eq!(picked(&slaac, &transient), pair("", "2409:8a1e:3b41:79f0:211:2233:4455:6677"));
         // A transient address is still better than none.
         assert_eq!(picked(&slaac[..1], &transient), pair("", slaac[0]));
+    }
+
+    #[test]
+    fn a_wireguard_link_lends_only_a_public_v6() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(lends_address("wg0", ip("2001:db8::2")), "a routed prefix through the tunnel");
+        assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
+        assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
+        assert!(!lends_address("wg0", ip("fd00::2")));
+        assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
+        assert!(!lends_address("tailscale0", ip("2001:db8::2")));
+        for name in ["wgcf", "warp", "CloudflareWARP"] {
+            assert!(!lends_address(name, ip("2606:4700:110:8a36::1")), "WARP's shared address under {name}");
+        }
+        assert!(lends_address("warp", ip("2001:db8::3")), "only the range is left out, not the name");
+
+        // What `addresses` makes of a machine with a private v4 and a v6 only
+        // through WireGuard.
+        let held: Vec<IpAddr> = [("eth0", "10.0.0.2"), ("wg0", "10.9.0.2"), ("wg0", "2001:db8::2")]
+            .into_iter()
+            .filter(|(n, a)| lends_address(n, ip(a)))
+            .map(|(_, a)| ip(a))
+            .collect();
+        assert_eq!(pick(&held, &[]), ("10.0.0.2".to_owned(), "2001:db8::2".to_owned()));
     }
 
     #[test]
@@ -1177,13 +1609,24 @@ mod tests {
         assert_eq!(shadowed_mounts(table), vec!["/home"]);
         // A point mounted once is not shadowed, however many others exist.
         assert!(shadowed_mounts("/dev/vda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n").is_empty());
+        // What ProtectHome leaves of the host's table: /home covered, mounts
+        // beneath /root and /home gone, /dev/vdd1 still reachable at /srv.
+        let host = "/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\n/dev/vdc1 /home/data ext4 rw 0 0\n\
+                    /dev/vdd1 /root/backup ext4 rw 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
+        let own = "/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\ntmpfs /home tmpfs ro 0 0\n\
+                   tmpfs /root tmpfs ro 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
+        assert_eq!(hidden_mounts(host, own), ["/home", "/home/data"]);
+        assert!(hidden_mounts(host, host).is_empty(), "the same namespace hides nothing");
     }
 
     #[test]
     fn real_host_collection_is_sane() {
         let mut c = Collector::default();
         let f = c.facts();
-        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
+        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && c.capacities()[0].1 > 0);
+        // A session sends the facts again whenever they differ, so a field that
+        // moves on its own would resend them every minute.
+        assert!(c.facts() == f, "facts collected twice on an idle host differ");
         // Whatever this host reports must parse, and a virtual bridge must not
         // be selected.
         assert!(f.ipv4.is_empty() || f.ipv4.parse::<std::net::Ipv4Addr>().is_ok());
@@ -1199,6 +1642,22 @@ mod tests {
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
+        assert!(m.uptime > 0 && m.procs > 1, "uptime {} s, {} processes", m.uptime, m.procs);
+        // Every core kept busy between two samples: idle time read as busy
+        // would show under half.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::thread::scope(|s| {
+            for _ in 0..cores {
+                s.spawn(|| {
+                    let spin = std::time::Instant::now();
+                    while spin.elapsed() < std::time::Duration::from_millis(300) {
+                        std::hint::black_box(0u64);
+                    }
+                });
+            }
+        });
+        let busy = c.collect().cpu;
+        assert!(busy > 50.0, "{busy}% with every core busy");
     }
 }
 
@@ -1262,6 +1721,27 @@ mod crosscheck {
         let parse = |v: Option<&str>| v.expect("df column").parse::<u64>().expect("a byte count");
         assert_eq!(disk_total, parse(row.next()), "f_blocks is not df's size");
         close(disk_used, parse(row.next()), "disk");
+    }
+
+    /// The virtualization type against `systemd-detect-virt`, which reads the
+    /// same CPUID leaf and, as root, the container records this agent reads
+    /// unprivileged. It names four platforms by their vendor instead; its
+    /// `oracle` is VirtualBox, which would read as Oracle's cloud, a KVM one.
+    #[test]
+    fn virtualization_agrees_with_systemd_detect_virt() {
+        // Its exit status is 1 when the answer is `none`.
+        let out = std::process::Command::new("systemd-detect-virt")
+            .output()
+            .unwrap_or_else(|e| panic!("systemd-detect-virt(1) is what this is checked against: {e}"));
+        let theirs = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let theirs = match theirs.as_str() {
+            "microsoft" => "hyper-v",
+            "oracle" => "virtualbox",
+            "amazon" | "google" => "kvm",
+            other => other,
+        };
+        println!("virt {}", virtualization());
+        assert_eq!(virtualization(), theirs);
     }
 
     /// A missing tool is a failure rather than grounds for passing quietly:
