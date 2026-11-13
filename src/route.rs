@@ -209,7 +209,7 @@ async fn trace(
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!("{}", if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() });
     }
-    let payload: Value = serde_json::from_slice(&output.stdout).context("invalid NextTrace JSON")?;
+    let payload: Value = parse_nexttrace_output(&output.stdout)?;
     let hops = successful_hops(&payload);
     Ok(RouteItem {
         stack,
@@ -288,6 +288,23 @@ fn normalize_region(region: &str) -> String {
         "" | "中国" | "本地" | "保留地址" => String::new(),
         place => place.to_owned(),
     }
+}
+
+/// Some NextTrace builds print capability advice to stdout before the JSON.
+fn parse_nexttrace_output(stdout: &[u8]) -> Result<Value> {
+    let mut offset = 0;
+    for line in stdout.split_inclusive(|byte| *byte == b'\n') {
+        if line.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
+            let payload: Value =
+                serde_json::from_slice(&stdout[offset..]).context("invalid NextTrace JSON")?;
+            if payload.get("Hops").is_some_and(Value::is_array) {
+                return Ok(payload);
+            }
+            break;
+        }
+        offset += line.len();
+    }
+    bail!("invalid NextTrace JSON")
 }
 
 fn successful_hops(payload: &Value) -> Vec<Value> {
@@ -382,6 +399,17 @@ fn hop_ips(hop: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nexttrace_json_accepts_capability_advice_before_hops() {
+        let expected = serde_json::json!({"Hops": []});
+        assert_eq!(parse_nexttrace_output(br#"{"Hops":[]}"#).unwrap(), expected);
+        let mixed = "权限提示：请检查 ICMP 权限\r\nRun setcap if needed\n  {\"Hops\":[]}\n";
+        assert_eq!(parse_nexttrace_output(mixed.as_bytes()).unwrap(), expected);
+        assert!(parse_nexttrace_output(b"socket: operation not permitted").is_err());
+        assert!(parse_nexttrace_output(br#"{"error":"failed"}"#).is_err());
+        assert!(parse_nexttrace_output(br#"{"Hops":["#).is_err());
+    }
 
     #[test]
     fn province_targets_are_fixed() {
